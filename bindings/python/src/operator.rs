@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+use pyo3::exceptions::PyValueError;
 use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -31,9 +32,31 @@ use crate::*;
 
 fn build_operator(
     scheme: ocore::Scheme,
-    map: HashMap<String, String>,
+    mut map: HashMap<String, String>,
 ) -> PyResult<ocore::Operator> {
-    let op = ocore::Operator::via_iter(scheme, map).map_err(format_pyerr)?;
+    // Extract verify_ssl from map (defaults to "true" if not present)
+    let verify_ssl = match map.remove("verify_ssl") {
+        Some(raw) => parse_verify_ssl(&raw)?,
+        None => true,
+    };
+
+    let mut op = ocore::Operator::via_iter(scheme, map).map_err(format_pyerr)?;
+
+    // If verify_ssl is false, create a custom HTTP client that disables SSL verification
+    if !verify_ssl {
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .map_err(|err| {
+                ocore::Error::new(ocore::ErrorKind::Unexpected, "failed to build HTTP client")
+                    .set_source(err)
+            })
+            .map_err(format_pyerr)?;
+
+        let http_client = ocore::raw::HttpClient::with(client);
+        op = op.layer(ocore::layers::HttpClientLayer::new(http_client));
+    }
+
     Ok(op)
 }
 
@@ -41,12 +64,37 @@ fn build_blocking_operator(
     scheme: ocore::Scheme,
     map: HashMap<String, String>,
 ) -> PyResult<ocore::blocking::Operator> {
-    let op = ocore::Operator::via_iter(scheme, map).map_err(format_pyerr)?;
+    let op = build_operator(scheme, map)?;
 
     let runtime = pyo3_async_runtimes::tokio::get_runtime();
     let _guard = runtime.enter();
     let op = ocore::blocking::Operator::new(op).map_err(format_pyerr)?;
     Ok(op)
+}
+
+fn extract_verify_ssl_value(value: &Bound<PyAny>) -> PyResult<String> {
+    if let Ok(b) = value.extract::<bool>() {
+        Ok(b.to_string())
+    } else {
+        value.extract::<String>()
+    }
+}
+
+fn parse_verify_ssl(raw: &str) -> PyResult<bool> {
+    let normalized = raw.trim();
+    if normalized.is_empty() {
+        return Err(PyValueError::new_err(
+            "verify_ssl must not be an empty string",
+        ));
+    }
+
+    match normalized.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "y" | "on" => Ok(true),
+        "false" | "0" | "no" | "n" | "off" => Ok(false),
+        _ => Err(PyValueError::new_err(format!(
+            "Invalid value for verify_ssl: `{normalized}` (expected a boolean or one of true/false/1/0/yes/no/on/off)"
+        ))),
+    }
 }
 
 /// The blocking equivalent of `AsyncOperator`.
@@ -75,6 +123,8 @@ impl Operator {
     ///     The scheme of the service.
     /// **kwargs : dict
     ///     The options for the service.
+    ///     Special option: verify_ssl (bool, default=True) - Whether to verify SSL certificates.
+    ///     Set to False to disable SSL certificate verification for self-signed certificates.
     ///
     /// Returns
     /// -------
@@ -102,12 +152,19 @@ impl Operator {
                 "Invalid type for scheme, expected str or Scheme",
             ))
         }?;
-        let map = kwargs
-            .map(|v| {
-                v.extract::<HashMap<String, String>>()
-                    .expect("must be valid hashmap")
-            })
-            .unwrap_or_default();
+
+        let mut map = HashMap::new();
+        if let Some(dict) = kwargs {
+            for (key, value) in dict.iter() {
+                let key_str = key.extract::<String>()?;
+                // Handle verify_ssl specially to support bool values
+                if key_str == "verify_ssl" {
+                    map.insert(key_str, extract_verify_ssl_value(&value)?);
+                } else {
+                    map.insert(key_str, value.extract::<String>()?);
+                }
+            }
+        }
 
         Ok(Operator {
             core: build_blocking_operator(scheme, map.clone())?,
@@ -724,6 +781,8 @@ impl AsyncOperator {
     ///     The scheme of the service.
     /// **kwargs : dict
     ///     The options for the service.
+    ///     Special option: verify_ssl (bool, default=True) - Whether to verify SSL certificates.
+    ///     Set to False to disable SSL certificate verification for self-signed certificates.
     ///
     /// Returns
     /// -------
@@ -731,7 +790,7 @@ impl AsyncOperator {
     ///     The new async operator.
     #[gen_stub(skip)]
     #[new]
-    #[pyo3(signature = (scheme, * ,**kwargs))]
+    #[pyo3(signature = (scheme, *, **kwargs))]
     pub fn new(
         #[gen_stub(override_type(type_repr = "builtins.str | opendal.services.Scheme", imports=("builtins", "opendal.services")))]
         scheme: Bound<PyAny>,
@@ -752,12 +811,18 @@ impl AsyncOperator {
             ))
         }?;
 
-        let map = kwargs
-            .map(|v| {
-                v.extract::<HashMap<String, String>>()
-                    .expect("must be valid hashmap")
-            })
-            .unwrap_or_default();
+        let mut map = HashMap::new();
+        if let Some(dict) = kwargs {
+            for (key, value) in dict.iter() {
+                let key_str = key.extract::<String>()?;
+                // Handle verify_ssl specially to support bool values
+                if key_str == "verify_ssl" {
+                    map.insert(key_str, extract_verify_ssl_value(&value)?);
+                } else {
+                    map.insert(key_str, value.extract::<String>()?);
+                }
+            }
+        }
 
         Ok(AsyncOperator {
             core: build_operator(scheme, map.clone())?,
