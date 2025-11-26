@@ -74,6 +74,17 @@ impl HdfsNativeBuilder {
         self.config.enable_append = enable_append;
         self
     }
+
+    /// Set user to connect as.
+    ///
+    /// This is thread-safe and takes precedence over the `HADOOP_USER_NAME`
+    /// environment variable.
+    pub fn user(mut self, user: &str) -> Self {
+        if !user.is_empty() {
+            self.config.user = Some(user.to_string());
+        }
+        self
+    }
 }
 
 impl Builder for HdfsNativeBuilder {
@@ -93,10 +104,11 @@ impl Builder for HdfsNativeBuilder {
         let root = normalize_root(&self.config.root.unwrap_or_default());
         debug!("backend use root {root}");
 
-        let client = hdfs_native::ClientBuilder::new()
-            .with_url(name_node)
-            .build()
-            .map_err(parse_hdfs_error)?;
+        let mut builder = hdfs_native::ClientBuilder::new().with_url(name_node);
+        if let Some(user) = &self.config.user {
+            builder = builder.with_user(user);
+        }
+        let client = builder.build().map_err(parse_hdfs_error)?;
 
         // need to check if root dir exists, create if not
         Ok(HdfsNativeBackend {

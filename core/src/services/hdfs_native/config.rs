@@ -34,6 +34,9 @@ pub struct HdfsNativeConfig {
     pub name_node: Option<String>,
     /// enable the append capacity
     pub enable_append: bool,
+    /// User to connect as. This is thread-safe and takes precedence over
+    /// the `HADOOP_USER_NAME` environment variable.
+    pub user: Option<String>,
 }
 
 impl Debug for HdfsNativeConfig {
@@ -42,6 +45,7 @@ impl Debug for HdfsNativeConfig {
             .field("root", &self.root)
             .field("name_node", &self.name_node)
             .field("enable_append", &self.enable_append)
+            .field("user", &self.user)
             .finish_non_exhaustive()
     }
 }
